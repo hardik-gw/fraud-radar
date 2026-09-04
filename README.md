@@ -189,7 +189,7 @@ Two engineered history features carry real signal, and two carry none:
 | Feature | Fraud (median) | Legitimate | Verdict |
 |---|---:|---:|---|
 | `amt_vs_card_mean` — amount in σ above this card's own average | 2.49 | −0.19 | strong |
-| `implied_kmh` — travel speed implied since the last transaction | 64.0 | 21.0 | useful |
+| `implied_kmh` — travel speed implied since the last transaction | 64.28 | 21.0 | useful |
 | `home_to_merchant_km` | 78.10 | 78.22 | **dead** |
 | `km_from_prev_txn` | 100.26 | 100.76 | **dead** |
 
