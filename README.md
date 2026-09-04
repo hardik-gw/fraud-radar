@@ -4,7 +4,7 @@ A real-time transaction-scoring pipeline: an anomaly-detection model trained on 
 fraud data, served behind an API, and fed by a live Kafka stream. The same shape as a production
 fraud system like Stripe Radar, built end to end.
 
-> **Status:** Phase 0 complete. Under active construction — see [Build phases](#build-phases).
+> **Status:** Phases 0–1 complete. Under active construction — see [Build phases](#build-phases).
 
 ---
 
@@ -41,21 +41,26 @@ Stating that limit up front is deliberate. The engineering is the point; oversel
 
 ## The dataset
 
-[Credit Card Fraud Detection (mlg-ulb)](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) —
-284,807 transactions from European cardholders over two days in September 2013.
+[Sparkov simulated card transactions](https://www.kaggle.com/datasets/kartik2112/fraud-detection) —
+**1,852,394 transactions**, 999 cardholders, 800 merchants, spanning **1 Jan 2019 to 31 Dec 2020**.
+Fraud is **0.52%** overall.
 
-**492 of them are fraud: 0.172%.**
+The data ships already split in time: training runs to 21 Jun 2020, testing from there to year end.
+Every number in this repo comes from that chronological hold-out, so the model is always predicting
+forward — the only thing a deployed system can do. The fraud rate itself moves across the boundary,
+from **0.579% to 0.386%**, so the target genuinely drifts.
 
-That number drives every modeling decision in this repo. A model that predicts "never fraud" is
-99.83% accurate and catches nothing, so accuracy is not reported anywhere here. Evaluation uses
-precision, recall, F1, and PR-AUC.
+### Why not the usual ULB `creditcard.csv`?
 
-Features `V1`–`V28` are PCA components (the originals are confidential). `Time` and `Amount` are raw.
-`Class` is the label: 1 = fraud.
+That dataset was the original choice and was swapped out at the start of Phase 1. Its features are
+PCA components (`V1`–`V28`) with the real meanings deliberately removed, which makes two of this
+project's goals impossible: explanations that read as anything but `V14 = -2.31`, and any feature
+engineering over customer or merchant history. Since history features *are* production fraud
+detection, that was disqualifying.
 
-The CSV is ~150 MB and is **not** in this repository — see setup below.
-
----
+**The trade made in return:** Sparkov is simulated, ULB was real. Fraud here is cleaner and more
+separable than reality, so **the metrics below are optimistic**. They are honest about this data;
+they are not a claim about production performance.
 
 ## Setup
 
@@ -115,6 +120,8 @@ dashboard/        Streamlit live dashboard           (Phase 4)
 models/           saved, version-tagged artifacts (gitignored)
 tests/            pytest
 docs/             architecture diagram, notes
+fraud_radar/      shared library — features, models, evaluation
+scripts/          train.py — trains all four models, writes models/metrics.json
 plans/            per-phase execution plans
 ```
 
@@ -122,28 +129,79 @@ plans/            per-phase execution plans
 
 ## Model comparison
 
-*Populated in Phase 1. Three models, same metrics, and a written justification for the one chosen
-and the threshold it runs at.*
+Four models, one chronological test set (555,719 transactions, 2,145 frauds), identical metrics.
+Every model is scored at the **same review budget** — 50 flagged transactions per 10,000, or 0.5% of
+volume — so precision and recall are directly comparable: each is allowed the same number of alerts,
+and the question is how much fraud it catches with them.
 
-| Model | Type | Precision | Recall | F1 | PR-AUC |
-|---|---|---|---|---|---|
-| Isolation Forest | Unsupervised | — | — | — | — |
-| Autoencoder | Unsupervised | — | — | — | — |
-| Logistic Regression / XGBoost | Supervised | — | — | — | — |
+Accuracy is not reported anywhere. At a 0.39% fraud rate, flagging nothing scores 99.6%.
+
+| Model | Type | PR-AUC | Precision | Recall | F1 | Caught | False alarms | Missed |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **Gradient boosting** | Supervised | **0.836** | 0.663 | 0.860 | 0.749 | 1,844 | 936 | 301 |
+| Logistic regression | Supervised | 0.302 | 0.402 | 0.521 | 0.454 | 1,118 | 1,661 | 1,027 |
+| Isolation forest | Unsupervised | 0.255 | 0.287 | 0.372 | 0.324 | 798 | 1,981 | 1,347 |
+| Autoencoder | Unsupervised | 0.211 | 0.349 | 0.453 | 0.394 | 971 | 1,808 | 1,174 |
+
+Reproduce with `uv run python scripts/train.py`; see
+[`notebooks/02-model-comparison.ipynb`](notebooks/02-model-comparison.ipynb) for the PR curves.
+
+### Chosen model and threshold
+
+**Gradient boosting** (`HistGradientBoostingClassifier`) at a **threshold of 0.0113**.
+
+That threshold was not chosen by maximising F1, which assumes a false alarm and a missed fraud cost
+the same — they never do. It was chosen by fixing what a review team can absorb and reading off the
+consequences. At 50 flags per 10,000 transactions, the model **catches 86.0% of fraud**, and an
+analyst working that queue finds real fraud **66.3%** of the time. The cost is 301 frauds missed and
+936 customers needlessly queried. Moving the threshold trades those against each other, and that
+trade is a business decision, not a modelling one.
+
+`HistGradientBoostingClassifier` rather than XGBoost because XGBoost's macOS wheels need `libomp`
+from Homebrew, which isn't available on the target machine. Scikit-learn's implementation is
+equivalent for this data and removes the dependency entirely.
 
 ### Why not just use the labels?
 
-*Written up in Phase 1.* Short version: a supervised classifier can only recognise fraud patterns it
-has already seen labelled. Real fraud systems face new patterns continuously, with labels arriving
-days later via chargebacks — which is the actual argument for anomaly detection. The supervised model
-here is the honest baseline the unsupervised approach has to justify itself against.
+The supervised model wins decisively — PR-AUC 0.836 against 0.255 and 0.211 — and pretending
+otherwise would mean torturing the setup until the answer changed. When labels exist and test-period
+fraud resembles training-period fraud, supervised learning wins. That is the expected result.
 
----
+The case for the unsupervised models is narrower and worth stating precisely:
+
+- They used **no labels at all**. In production, labels arrive weeks late via chargebacks, so a
+  supervised model retrained today is learning from last month's fraud.
+- They flag departures from normal, so they can in principle catch a pattern nobody has labelled yet.
+- They are the only option for a new segment, product or region with no fraud history.
+
+**What this comparison does not prove:** that the unsupervised models handle novel fraud better.
+Nothing in this test period is genuinely novel — the simulator generates fraud from a fixed recipe.
+Demonstrating that claim needs a test period containing a pattern absent from training, which is the
+drift stretch goal and is not built yet.
+
+The deployed artifact is therefore the gradient boosting pipeline. The autoencoder stays in the
+codebase as a comparison and as the basis for the drift work.
+
+### What the feature engineering found
+
+Two engineered history features carry real signal, and two carry none:
+
+| Feature | Fraud (median) | Legitimate | Verdict |
+|---|---:|---:|---|
+| `amt_vs_card_mean` — amount in σ above this card's own average | 2.49 | −0.19 | strong |
+| `implied_kmh` — travel speed implied since the last transaction | 64.0 | 21.0 | useful |
+| `home_to_merchant_km` | 78.10 | 78.22 | **dead** |
+| `km_from_prev_txn` | 100.26 | 100.76 | **dead** |
+
+The geographic features are inert because Sparkov scatters merchants around each customer at random
+regardless of fraud. In real card data geography is one of the strongest available signals, so this
+is a limitation of the simulation rather than a finding about fraud. They are reported rather than
+quietly deleted.
 
 ## Build phases
 
 - [x] **0 · Setup & scoping** — repo, environment, dataset
-- [ ] **1 · Data & modeling foundation** — EDA, three models, evaluation under class imbalance
+- [x] **1 · Data & modeling foundation** — EDA, four models, evaluation under class imbalance
 - [ ] **2 · Serving layer** — FastAPI `/score`, `/health`, structured logging, tests
 - [ ] **3 · Streaming layer** — Kafka + Postgres via Docker Compose
 - [ ] **4 · Observability & explainability** — Streamlit dashboard, latency stats, SHAP
