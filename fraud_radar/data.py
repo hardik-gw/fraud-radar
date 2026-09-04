@@ -9,9 +9,11 @@ RAW_DIR = ROOT / "data" / "raw"
 PROCESSED_DIR = ROOT / "data" / "processed"
 FEATURE_CACHE = PROCESSED_DIR / "features.parquet"
 
-# Columns we drop immediately. Names, addresses and transaction hashes identify
-# people without predicting anything; keeping them invites both leakage and an
-# unnecessary privacy footprint.
+# Columns we drop immediately. Names and addresses identify people without
+# predicting anything; keeping them invites both leakage and an unnecessary
+# privacy footprint. `trans_num` is kept — it is a random hash, not personal
+# data, and the streaming pipeline needs a stable id to make inserts idempotent
+# when a message is redelivered.
 #
 # `unix_time` is dropped for a different reason: it does not agree with
 # `trans_date_trans_time`. The offset between them changes on every row, and it
@@ -22,7 +24,6 @@ DROP_COLS = [
     "first",
     "last",
     "street",
-    "trans_num",
     "unix_time",
 ]
 

@@ -1,0 +1,11 @@
+data/
+models/*
+!models/metrics.json
+notebooks/
+plans/
+.venv/
+.git/
+__pycache__/
+*.parquet
+.pytest_cache/
+.ruff_cache/

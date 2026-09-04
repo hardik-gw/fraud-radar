@@ -4,7 +4,7 @@ A real-time transaction-scoring pipeline: an anomaly-detection model trained on 
 fraud data, served behind an API, and fed by a live Kafka stream. The same shape as a production
 fraud system like Stripe Radar, built end to end.
 
-> **Status:** Phases 0–2 complete. Under active construction — see [Build phases](#build-phases).
+> **Status:** Phases 0–2 complete, Phase 3 written but not yet run. Under active construction — see [Build phases](#build-phases).
 
 ---
 
@@ -114,7 +114,7 @@ Never fix this by disabling certificate verification.
 data/raw/         downloaded dataset (gitignored)
 data/processed/   derived data — raw is never modified in place (gitignored)
 notebooks/        numbered exploration: 00-load-check, 01-eda, ...
-streaming/        Kafka producer + consumer          (Phase 3)
+streaming/        Kafka producer, consumer, and the transport-free pipeline
 dashboard/        Streamlit live dashboard           (Phase 4)
 models/           saved, version-tagged artifacts (gitignored)
 tests/            pytest
@@ -259,12 +259,67 @@ One JSON object per request, on stdout. Structured rather than printed prose bec
 these lines for throughput and p50/p95 latency. Card numbers are logged as their last four digits
 only.
 
+## The streaming stack
+
+```bash
+docker compose up --build       # Kafka + Postgres + API + consumer + producer
+```
+
+> **Not yet run.** The code is complete and the pipeline is tested end to end, but Kafka and Postgres
+> have never actually been started — Docker isn't installed on the development machine. See
+> [`plans/phase-3-streaming-plan.md`](plans/phase-3-streaming-plan.md) for exactly what is verified
+> and what isn't.
+
+A producer replays the 2020 hold-out onto a Kafka topic at a configurable rate; a consumer scores
+each transaction and writes the result to Postgres.
+
+```
+producer ──▶ Kafka topic `transactions` ──▶ consumer ──▶ Postgres
+ replays        4 partitions, keyed              scores       scored_transactions
+ the hold-out   by card number                   in process
+```
+
+### Why the topic is keyed by card number
+
+The service keeps each card's recent history in memory. Run two consumers and, naively, each would
+hold half-blind copy of the same card.
+
+One argument fixes it: `key=cc_num`. Kafka routes messages with the same key to the same partition,
+and each partition is read by exactly one consumer in a group — so a card's whole history always
+lands in the same process. **No Redis, no shared cache, no distributed locking.** This is how
+stateful stream processing is normally done, Kafka Streams included.
+
+The topic has 4 partitions, which is also the ceiling on useful consumers; a fifth would sit idle.
+
+### Not losing messages
+
+```python
+store.flush()      # rows are durable
+consumer.commit()  # only now admit we've read them
+```
+
+If the consumer dies between those two lines, Kafka redelivers the batch and rows are written twice.
+Reversed, a crash would lose the batch permanently. **Duplicates are recoverable, gaps are not.**
+The duplicates are then absorbed by the primary key on `trans_id`, so at-least-once delivery plus
+idempotent writes behaves like exactly-once in the table.
+
+Backpressure needs no handling at all: Kafka is a log, not a queue that overflows. A slow consumer
+reads further behind, and lag becomes a metric to watch rather than data to lose. The producer emits
+occasional bursts specifically to exercise that.
+
+### Testing without Docker
+
+[`streaming/pipeline.py`](streaming/pipeline.py) knows nothing about Kafka or Postgres, so
+[`tests/test_pipeline.py`](tests/test_pipeline.py) swaps the broker for a list and the database for
+SQLite and runs the whole path. It asserts that streamed scores match the batch pipeline to within
+**1e-12** across a full card history — the same anti-skew discipline as Phase 2.
+
 ## Build phases
 
 - [x] **0 · Setup & scoping** — repo, environment, dataset
 - [x] **1 · Data & modeling foundation** — EDA, four models, evaluation under class imbalance
 - [x] **2 · Serving layer** — FastAPI `/score`, `/health`, structured logging, tests
-- [ ] **3 · Streaming layer** — Kafka + Postgres via Docker Compose
+- [~] **3 · Streaming layer** — Kafka + Postgres via Docker Compose *(code complete, stack unrun — needs Docker)*
 - [ ] **4 · Observability & explainability** — Streamlit dashboard, latency stats, SHAP
 - [ ] **5 · Packaging** — one-command startup, architecture diagram, final write-up
 
