@@ -67,21 +67,39 @@ git clone <this repo> && cd fraud-radar
 uv sync                       # creates .venv from uv.lock — exact pinned versions
 ```
 
-Then fetch the dataset. You need a free Kaggle account, and you must open the
-[dataset page](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) once to accept its terms.
-Create a token at [kaggle.com/settings/api](https://www.kaggle.com/settings/api), then:
+Then fetch the dataset (~144 MB uncompressed). No Kaggle account required:
 
 ```bash
-mkdir -p ~/.kaggle && mv ~/Downloads/kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
-uv run kaggle datasets download -d mlg-ulb/creditcardfraud -p data/raw --unzip
+curl -L -o data/raw/creditcardfraud.zip \
+  "https://www.kaggle.com/api/v1/datasets/download/mlg-ulb/creditcardfraud"
+unzip -o data/raw/creditcardfraud.zip -d data/raw/ && rm data/raw/creditcardfraud.zip
 ```
 
 Verify:
 
 ```bash
 uv run python -c "import pandas as pd; d=pd.read_csv('data/raw/creditcard.csv'); print(d.shape, d.Class.mean())"
-# expected: (284807, 31) 0.001727485630620034
+# expected: (284807, 31) 0.0017274845...
 ```
+
+Or run [`notebooks/00-load-check.ipynb`](notebooks/00-load-check.ipynb), which asserts all of the
+above and shows why accuracy is the wrong metric here.
+
+### Troubleshooting: TLS-inspecting proxies
+
+On a corporate network that intercepts TLS, Python downloads (`kagglehub`, `pip`, `requests`) fail
+with `CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain`, while `curl` works
+fine. The cause is that curl trusts the OS certificate store — which has the proxy's root CA — and
+Python uses its own bundled `certifi` store, which doesn't.
+
+Use the `curl` command above, or make Python use the OS store:
+
+```bash
+uv add --dev truststore
+uv run python -c "import truststore; truststore.inject_into_ssl(); import kagglehub; print(kagglehub.dataset_download('mlg-ulb/creditcardfraud'))"
+```
+
+Never fix this by disabling certificate verification.
 
 ---
 

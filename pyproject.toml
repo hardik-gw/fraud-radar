@@ -15,6 +15,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "kaggle>=2.2.4",
+    "kagglehub>=1.0.2",
     "pytest>=9.1.1",
     "ruff>=0.16.6",
 ]
