@@ -94,7 +94,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # --- the card's recent history ---------------------------------------
     by_card = df.groupby("cc_num", sort=False)
 
-    df["secs_since_prev_txn"] = by_card["unix_time"].diff()
+    # Derived from `ts`, NOT from the dataset's `unix_time` column. Those two
+    # clocks disagree: the offset between them differs on every row, and
+    # unix_time can jump a whole extra day at a month boundary. tests/
+    # test_no_skew.py caught this by comparing against the online path.
+    df["secs_since_prev_txn"] = by_card["ts"].diff().dt.total_seconds()
 
     prev_lat = by_card["merch_lat"].shift()
     prev_long = by_card["merch_long"].shift()

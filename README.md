@@ -4,7 +4,7 @@ A real-time transaction-scoring pipeline: an anomaly-detection model trained on 
 fraud data, served behind an API, and fed by a live Kafka stream. The same shape as a production
 fraud system like Stripe Radar, built end to end.
 
-> **Status:** Phases 0–1 complete. Under active construction — see [Build phases](#build-phases).
+> **Status:** Phases 0–2 complete. Under active construction — see [Build phases](#build-phases).
 
 ---
 
@@ -114,13 +114,13 @@ Never fix this by disabling certificate verification.
 data/raw/         downloaded dataset (gitignored)
 data/processed/   derived data — raw is never modified in place (gitignored)
 notebooks/        numbered exploration: 00-load-check, 01-eda, ...
-api/              FastAPI scoring service            (Phase 2)
 streaming/        Kafka producer + consumer          (Phase 3)
 dashboard/        Streamlit live dashboard           (Phase 4)
 models/           saved, version-tagged artifacts (gitignored)
 tests/            pytest
 docs/             architecture diagram, notes
-fraud_radar/      shared library — features, models, evaluation
+fraud_radar/      shared library — features, models, state, scoring
+api/              FastAPI scoring service
 scripts/          train.py — trains all four models, writes models/metrics.json
 plans/            per-phase execution plans
 ```
@@ -138,23 +138,23 @@ Accuracy is not reported anywhere. At a 0.39% fraud rate, flagging nothing score
 
 | Model | Type | PR-AUC | Precision | Recall | F1 | Caught | False alarms | Missed |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| **Gradient boosting** | Supervised | **0.836** | 0.663 | 0.860 | 0.749 | 1,844 | 936 | 301 |
-| Logistic regression | Supervised | 0.302 | 0.402 | 0.521 | 0.454 | 1,118 | 1,661 | 1,027 |
-| Isolation forest | Unsupervised | 0.255 | 0.287 | 0.372 | 0.324 | 798 | 1,981 | 1,347 |
-| Autoencoder | Unsupervised | 0.211 | 0.349 | 0.453 | 0.394 | 971 | 1,808 | 1,174 |
+| **Gradient boosting** | Supervised | **0.827** | 0.664 | 0.860 | 0.749 | 1,844 | 935 | 301 |
+| Logistic regression | Supervised | 0.301 | 0.402 | 0.521 | 0.454 | 1,117 | 1,662 | 1,028 |
+| Autoencoder | Unsupervised | 0.297 | 0.375 | 0.485 | 0.423 | 1,041 | 1,738 | 1,104 |
+| Isolation forest | Unsupervised | 0.256 | 0.287 | 0.372 | 0.324 | 798 | 1,981 | 1,347 |
 
 Reproduce with `uv run python scripts/train.py`; see
 [`notebooks/02-model-comparison.ipynb`](notebooks/02-model-comparison.ipynb) for the PR curves.
 
 ### Chosen model and threshold
 
-**Gradient boosting** (`HistGradientBoostingClassifier`) at a **threshold of 0.0113**.
+**Gradient boosting** (`HistGradientBoostingClassifier`) at a **threshold of 0.01312**.
 
 That threshold was not chosen by maximising F1, which assumes a false alarm and a missed fraud cost
 the same — they never do. It was chosen by fixing what a review team can absorb and reading off the
 consequences. At 50 flags per 10,000 transactions, the model **catches 86.0% of fraud**, and an
-analyst working that queue finds real fraud **66.3%** of the time. The cost is 301 frauds missed and
-936 customers needlessly queried. Moving the threshold trades those against each other, and that
+analyst working that queue finds real fraud **66.4%** of the time. The cost is 301 frauds missed and
+935 customers needlessly queried. Moving the threshold trades those against each other, and that
 trade is a business decision, not a modelling one.
 
 `HistGradientBoostingClassifier` rather than XGBoost because XGBoost's macOS wheels need `libomp`
@@ -163,7 +163,7 @@ equivalent for this data and removes the dependency entirely.
 
 ### Why not just use the labels?
 
-The supervised model wins decisively — PR-AUC 0.836 against 0.255 and 0.211 — and pretending
+The supervised model wins decisively — PR-AUC 0.827 against 0.297 and 0.256 — and pretending
 otherwise would mean torturing the setup until the answer changed. When labels exist and test-period
 fraud resembles training-period fraud, supervised learning wins. That is the expected result.
 
@@ -198,11 +198,72 @@ regardless of fraud. In real card data geography is one of the strongest availab
 is a limitation of the simulation rather than a finding about fraud. They are reported rather than
 quietly deleted.
 
+## The scoring service
+
+```bash
+uv run uvicorn api.main:app --reload     # then open http://127.0.0.1:8000/docs
+```
+
+`POST /score` takes one transaction and returns a risk score; `GET /health` reports the loaded model
+and how many cards the service is tracking.
+
+```bash
+curl -X POST localhost:8000/score -H 'content-type: application/json' -d '{
+  "cc_num": 4111111111111111, "trans_date_trans_time": "2020-07-15T13:30:00",
+  "amt": 42.50, "category": "grocery_pos", "gender": "F", "state": "NC",
+  "lat": 36.0788, "long": -81.1781, "city_pop": 3495,
+  "merch_lat": 36.0113, "merch_long": -82.0483, "dob": "1988-03-09"}'
+```
+```json
+{"risk_score": 0.0021, "flagged": false, "threshold": 0.01312,
+ "model_version": "v1", "model_name": "gradient_boosting", "latency_ms": 3.4}
+```
+
+Round-trip over HTTP measures **~5 ms**, against a target of 100 ms.
+
+### The hard part: where does history come from?
+
+The model's strongest features describe a card's *past* — how far this amount sits from its usual,
+how many payments in the last hour. Training had all 1.85M rows in memory. A live service gets one
+transaction with no context.
+
+So the service carries a small running summary per card ([`fraud_radar/state.py`](fraud_radar/state.py)):
+a bounded 7-day deque of recent transactions plus Welford running mean and variance. Memory stays
+flat however long it runs. `CardStateStore` is a plain dict for now; Phase 3 swaps it for Redis so
+several consumers share one view, and only two methods have to change.
+
+The rule that keeps training and serving aligned:
+
+| | |
+|---|---|
+| **batch** | `.shift()` before any aggregate, so a row never sees itself |
+| **online** | read features **before** `update()`, so a transaction never sees itself |
+
+They are the same rule, and [`tests/test_no_skew.py`](tests/test_no_skew.py) replays thousands of
+real transactions through both paths and asserts every history feature agrees to 1e-9.
+
+Verified end to end: replaying all 2,915 transactions of one real card through the service and
+comparing against the batch pipeline gives a **maximum score difference of 0.0000000000**. On that
+card's 8 real frauds the service averages 0.877 and flags **8 of 8**.
+
+### Input validation
+
+[`api/schemas.py`](api/schemas.py) rejects bad payloads with a 422 that names each offending field,
+before anything reaches the model. This matters because **a model handed nonsense does not raise an
+error** — it returns a confident score computed from nonsense. Amounts must be positive, coordinates
+must be real coordinates, and the merchant category must be one the model was actually trained on.
+
+### Logging
+
+One JSON object per request, on stdout. Structured rather than printed prose because Phase 4 parses
+these lines for throughput and p50/p95 latency. Card numbers are logged as their last four digits
+only.
+
 ## Build phases
 
 - [x] **0 · Setup & scoping** — repo, environment, dataset
 - [x] **1 · Data & modeling foundation** — EDA, four models, evaluation under class imbalance
-- [ ] **2 · Serving layer** — FastAPI `/score`, `/health`, structured logging, tests
+- [x] **2 · Serving layer** — FastAPI `/score`, `/health`, structured logging, tests
 - [ ] **3 · Streaming layer** — Kafka + Postgres via Docker Compose
 - [ ] **4 · Observability & explainability** — Streamlit dashboard, latency stats, SHAP
 - [ ] **5 · Packaging** — one-command startup, architecture diagram, final write-up

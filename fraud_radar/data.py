@@ -4,17 +4,26 @@ from pathlib import Path
 
 import pandas as pd
 
-RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
+ROOT = Path(__file__).resolve().parent.parent
+RAW_DIR = ROOT / "data" / "raw"
+PROCESSED_DIR = ROOT / "data" / "processed"
+FEATURE_CACHE = PROCESSED_DIR / "features.parquet"
 
 # Columns we drop immediately. Names, addresses and transaction hashes identify
 # people without predicting anything; keeping them invites both leakage and an
 # unnecessary privacy footprint.
+#
+# `unix_time` is dropped for a different reason: it does not agree with
+# `trans_date_trans_time`. The offset between them changes on every row, and it
+# can advance a full extra day across a month boundary. Everything time-related
+# is derived from `ts` instead.
 DROP_COLS = [
     "Unnamed: 0",
     "first",
     "last",
     "street",
     "trans_num",
+    "unix_time",
 ]
 
 
@@ -48,3 +57,27 @@ def load_all() -> pd.DataFrame:
     """
     df = pd.concat([load_split("train"), load_split("test")], ignore_index=True)
     return df.sort_values("ts").reset_index(drop=True)
+
+
+def load_features(rebuild: bool = False) -> pd.DataFrame:
+    """Every transaction with its engineered features, cached.
+
+    Reading and parsing 478 MB of CSV, then rebuilding features, takes the best
+    part of a minute on a cold disk. The result is deterministic, so it is
+    written to Parquet once and read back in a second or two afterwards.
+
+    Pass rebuild=True after changing anything in features.py, or the cache will
+    quietly serve you the old columns.
+    """
+    from .features import build_features  # imported here to avoid a cycle
+
+    if FEATURE_CACHE.exists() and not rebuild:
+        return pd.read_parquet(FEATURE_CACHE)
+
+    df = build_features(load_all())
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_parquet(FEATURE_CACHE, index=False)
+    except Exception as exc:  # noqa: BLE001 - caching is an optimisation
+        print(f"warning: could not cache features ({exc}); rebuilding each run")
+    return df

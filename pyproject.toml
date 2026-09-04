@@ -3,6 +3,7 @@ name = "fraud-radar"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.141.1",
     "joblib>=1.6.0",
     "jupyter>=1.1.1",
     "matplotlib>=3.11.1",
@@ -11,10 +12,12 @@ dependencies = [
     "pyarrow>=25.0.1",
     "scikit-learn>=1.9.0",
     "seaborn>=0.13.2",
+    "uvicorn[standard]>=0.52.4",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "kaggle>=2.2.4",
     "kagglehub>=1.0.2",
     "pytest>=9.1.1",

@@ -13,7 +13,7 @@ import pandas as pd
 from sklearn.pipeline import Pipeline
 
 from fraud_radar import data, evaluate
-from fraud_radar.features import ALL_FEATURES, build_features
+from fraud_radar.features import ALL_FEATURES
 from fraud_radar.models import build_models, make_preprocessor
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,28 +33,11 @@ REVIEW_BUDGET_PER_10K = 50.0
 
 
 def prepare() -> pd.DataFrame:
-    """Load, engineer features, and cache the result."""
-    cache = PROCESSED_DIR / "features.parquet"
-    if cache.exists():
-        print(f"loading cached features from {cache.relative_to(ROOT)}")
-        return pd.read_parquet(cache)
-
-    print("loading raw data ...")
-    df = data.load_all()
-    print(f"  {len(df):,} transactions")
-
-    print("building features ...")
+    """Load the data with its engineered features (cached after the first run)."""
+    print("loading data + features ...")
     started = time.time()
-    df = build_features(df)
-    print(f"  done in {time.time() - started:.0f}s")
-
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        df.to_parquet(cache, index=False)
-        print(f"  cached to {cache.relative_to(ROOT)}")
-    except Exception as exc:  # noqa: BLE001 - the cache is an optimisation; any
-        # failure to write it (missing pyarrow, read-only disk) must not stop training
-        print(f"  (not cached: {exc})")
+    df = data.load_features()
+    print(f"  {len(df):,} transactions in {time.time() - started:.0f}s")
     return df
 
 
